@@ -1,0 +1,16 @@
+#!/usr/bin/python
+
+from bbqsql import *
+import argparse
+
+parser = argparse.ArgumentParser(prog='bbqsql')
+parser.add_argument('-V', '--version', action='version', version='%(prog)s 0.9')
+parser.add_argument('-c',  metavar='config', nargs='+', help='import config file', default=None)
+
+results = parser.parse_args()
+print results
+
+if results.c is not None:
+    bbqMenu(results.c[0])
+else:
+    bbqMenu()

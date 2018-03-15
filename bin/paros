@@ -1,0 +1,3 @@
+#!/bin/bash
+
+cd /usr/share/paros/ && java -jar paros.jar

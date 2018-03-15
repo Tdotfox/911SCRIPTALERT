@@ -1,0 +1,4 @@
+#!/bin/bash
+
+java -jar /usr/share/protos-sip/protos-sip.jar "$@"
+

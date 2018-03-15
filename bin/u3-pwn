@@ -1,0 +1,4 @@
+#!/bin/sh
+
+cd /usr/share/u3-pwn/
+exec ./u3-pwn.py

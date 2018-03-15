@@ -1,0 +1,3 @@
+#!/bin/bash
+
+cd /usr/share/jsql-injection/ && java -jar jsql-injection.jar "$@"

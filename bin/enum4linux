@@ -1,0 +1,3 @@
+#!/bin/bash
+
+cd /usr/share/enum4linux/ && ./enum4linux.pl "$@"

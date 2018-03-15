@@ -1,0 +1,3 @@
+#!/bin/bash
+
+cd /usr/share/magictree/ && java -jar MagicTree-build1814.jar "$@"

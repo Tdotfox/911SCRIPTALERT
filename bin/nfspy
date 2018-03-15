@@ -1,0 +1,4 @@
+#!/usr/bin/python
+
+from nfspy.fusefs import main, NFSFuse
+main(NFSFuse)

@@ -1,0 +1,5 @@
+#!/usr/bin/python
+
+from wx.tools.pywxrc import main
+main()
+

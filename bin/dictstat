@@ -1,0 +1,7 @@
+#!/bin/bash
+
+echo ""
+echo "The dictstat command is deprecated."
+echo ""
+echo "Use the command statsgen instead."
+echo ""

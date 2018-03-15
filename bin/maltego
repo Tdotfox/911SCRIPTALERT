@@ -1,0 +1,4 @@
+#!/bin/sh
+
+cd /usr/share/maltego/bin/
+exec ./maltego "$@" 2>/dev/null

@@ -1,0 +1,230 @@
+#!/bin/bash
+
+# Create a throw-away PostgreSQL environment for running regression tests.
+# This does not interfere with existing clusters.
+#
+# (C) 2005-2012 Martin Pitt <mpitt@debian.org>
+# (C) 2012-2017 Christoph Berg <myon@debian.org>
+#
+#  This program is free software; you can redistribute it and/or modify
+#  it under the terms of the GNU General Public License as published by
+#  the Free Software Foundation; either version 2 of the License, or
+#  (at your option) any later version.
+#
+#  This program is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU General Public License for more details.
+
+set -e # no -u here as that breaks PGCONF_OPTS[@]
+
+# wrap ourselves in newpid if requested
+if [ "$PG_VIRTUALENV_NEWPID" ]; then
+    unset PG_VIRTUALENV_NEWPID
+    exec newpid $0 "$@"
+fi
+
+# wrap ourselves in unshare if requested
+if [ "$PG_VIRTUALENV_UNSHARE" ]; then
+    export _PG_VIRTUALENV_UNSHARE="$PG_VIRTUALENV_UNSHARE"
+    unset PG_VIRTUALENV_UNSHARE
+    exec unshare $_PG_VIRTUALENV_UNSHARE -- $0 "$@"
+fi
+if [ "$_PG_VIRTUALENV_UNSHARE" ]; then
+    unset _PG_VIRTUALENV_UNSHARE
+    # start localhost interface
+    if [ -x /bin/ip ]; then
+        ip link set dev lo up || true
+    else
+        ifconfig lo up || true
+    fi
+fi
+
+help ()
+{
+    echo "pg_virtualenv: Create throw-away PostgreSQL environment for regression tests"
+    echo "Syntax: $0 [options] [command]"
+    echo "    -a                use all installed server versions"
+    echo "    -v 'version ...'  list of PostgreSQL versions to run [default: latest]"
+    echo "    -c 'options'      extra options to pass to pg_createcluster"
+    echo "    -i 'initdb opts'  extra initdb options to pass to pg_createcluster"
+    echo "    -o 'guc=value'    postgresql.conf options to pass to pg_createcluster"
+    echo "    -s                open a shell when command fails"
+    echo "    -t                use a temporary cluster directory even as root"
+    exit ${1:-0}
+}
+
+# option parsing
+PGBINROOT="/usr/lib/postgresql/"
+#redhat# PGBINROOT="/usr/pgsql-"
+PG_VERSIONS=""
+PGCONF_OPTS=()
+while getopts "ac:i:ho:stv:" opt ; do
+    case $opt in
+	a) for d in $PGBINROOT*/bin/pg_ctl; do
+		# prepend version so latest ends up first (i.e. on port 5432)
+                dir=${d%%/bin/pg_ctl}
+		PG_VERSIONS="${dir#$PGBINROOT} ${PG_VERSIONS:-}"
+	   done ;;
+	c) CREATE_OPTS="$OPTARG" ;;
+	i) INITDB_OPTS="$OPTARG" ;;
+	h) help ;;
+	o) PGCONF_OPTS+=("--pgoption" "$OPTARG") ;;
+	s) run_shell=1 ;;
+        t) NONROOT=1 ;;
+	v) PG_VERSIONS="$OPTARG" ;;
+	*) help 1 ;;
+    esac
+done
+if [ -z "$PG_VERSIONS" ]; then
+    # use latest version
+    d=$(ls -v $PGBINROOT*/bin/pg_ctl | tail -1)
+    dir=${d%%/bin/pg_ctl}
+    PG_VERSIONS="${dir#$PGBINROOT}"
+fi
+# shift away args
+shift $(($OPTIND - 1))
+# if no command is given, open a shell
+[ "${1:-}" ] || set -- ${SHELL:-/bin/sh}
+
+# we are not root
+if [ "$(id -u)" != 0 ]; then
+    NONROOT=1
+fi
+# we aren't really root in fakeroot
+case ${LD_PRELOAD:-} in
+    *fakeroot*) NONROOT=1 ;;
+esac
+
+# non-root operation: create a temp dir where we store everything
+if [ "${NONROOT:-}" ]; then
+    WORKDIR=$(mktemp -d -t pg_virtualenv.XXXXXX)
+    if [ $(id -u) = 0 ]; then
+        chown postgres:postgres $WORKDIR
+        umask 022
+    fi
+    export PG_CLUSTER_CONF_ROOT="$WORKDIR/postgresql"
+    export PGUSER="${USER:-${LOGNAME:-$(id -un)}}"
+    [ "$PGUSER" = "root" ] && PGUSER="postgres"
+    PGSYSCONFDIR="$WORKDIR/postgresql-common" # no export yet so pg_createcluster uses the original createcluster.conf
+    mkdir "$PGSYSCONFDIR" "$WORKDIR/log"
+    PWFILE="$PGSYSCONFDIR/pwfile"
+    LOGDIR="$WORKDIR/log"
+
+    cleanup () {
+	set +e
+	for v in $PG_VERSIONS; do
+            # don't drop existing clusters named "regress"
+            [ -f $PG_CLUSTER_CONF_ROOT/$v/regress/.by_pg_virtualenv ] || continue
+            echo "Dropping cluster $v/regress ..."
+	    pg_ctlcluster --mode immediate $v regress stop
+	done
+	rm -rf $WORKDIR
+    }
+    trap cleanup 0 HUP INT QUIT ILL ABRT PIPE TERM
+
+# root: keep everything in the standard locations
+else
+    for v in $PG_VERSIONS; do
+        if [ -d /etc/postgresql/$v/regress ]; then
+            echo "Cluster $v/regress exists, refusing to overwrite" >&2
+            exit 2
+        fi
+    done
+
+    : ${PGSYSCONFDIR:=/etc/postgresql-common}
+    pg_service="$PGSYSCONFDIR/pg_service.conf"
+
+    export PGUSER="postgres"
+    PWFILE=$(mktemp -t pgpassword.XXXXXX)
+    chown postgres:postgres "$PWFILE"
+
+    cleanup () {
+	set +e
+        rm -f $PWFILE $pg_service
+        if [ -f $pg_service.pg_virtualenv-save.$$ ]; then
+            mv -f $pg_service.pg_virtualenv-save.$$ $pg_service
+        fi
+	for v in $PG_VERSIONS; do
+            # don't drop existing clusters named "regress"
+            [ -f /etc/postgresql/$v/regress/.by_pg_virtualenv ] || continue
+            echo "Dropping cluster $v/regress ..."
+            rm -f /etc/postgresql/$v/regress/.by_pg_virtualenv
+	    pg_ctlcluster --mode immediate $v regress stop
+	    pg_dropcluster $v regress
+	done
+    }
+    trap cleanup 0 HUP INT QUIT ILL ABRT PIPE TERM
+
+    if [ -f $pg_service ]; then
+	mv --no-clobber $pg_service $pg_service.pg_virtualenv-save.$$
+    fi
+fi
+
+# create postgres environments
+if [ -x /usr/bin/pwgen ]; then
+    export PGPASSWORD=$(pwgen 20 1)
+else
+    export PGPASSWORD=$(dd if=/dev/urandom bs=1k count=1 2>/dev/null | md5sum - | awk '{ print $1 }')
+fi
+echo "$PGPASSWORD" > "$PWFILE"
+
+for v in $PG_VERSIONS; do
+    # create temporary cluster
+    # we chdir to / so programs don't throw "could not change directory to ..."
+    (
+	cd /
+        case $v in
+            8*|9.0|9.1|9.2) : ;;
+            *) NOSYNC="--nosync" ;;
+        esac
+	pg_createcluster \
+	    ${PGPORT:+-p "$PGPORT"} \
+	    ${NONROOT:+-d "$WORKDIR/data/$v/regress"} \
+	    ${NONROOT:+-l "$WORKDIR/log/postgresql-$v-regress.log"} \
+            ${CREATE_OPTS:-} --pgoption fsync=off "${PGCONF_OPTS[@]}" --start $v regress -- \
+	    --username="$PGUSER" --pwfile="$PWFILE" $NOSYNC ${INITDB_OPTS:-}
+	# in fakeroot, the username will likely default to "postgres" otherwise
+        echo "This is a temporary throw-away cluster" > ${PG_CLUSTER_CONF_ROOT:-/etc/postgresql}/$v/regress/.by_pg_virtualenv
+    )
+    port=$(pg_conftool -s $v regress show port)
+
+    # record cluster information in service file
+    cat >> $PGSYSCONFDIR/pg_service.conf <<EOF
+[$v]
+host=localhost
+port=$port
+dbname=postgres
+user=$PGUSER
+password=$PGPASSWORD
+
+EOF
+done
+
+export PGSYSCONFDIR
+export PGHOST="localhost"
+export PGDATABASE="postgres"
+case $PG_VERSIONS in
+    *\ *) ;; # multiple versions: do not set PGPORT because that breaks --cluster
+    *)
+        export PGPORT="$port"
+	export PG_CONFIG="$PGBINROOT$PG_VERSIONS/bin/pg_config"
+	;;
+esac
+
+# run program
+echo
+"$@" || EXIT="$?"
+if [ ${EXIT:-0} -gt 0 ]; then
+    for log in ${LOGDIR:-/var/log/postgresql}/*.log; do
+        echo "*** $log (last 100 lines) ***"
+	tail -100 $log
+    done
+
+    if [ "${run_shell:-}" ]; then
+	echo "pg_virtualenv: command exited with status $EXIT, dropping you into a shell"
+	${SHELL:-/bin/sh}
+    fi
+fi
+
+exit ${EXIT:-0}

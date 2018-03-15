@@ -1,0 +1,398 @@
+#!/usr/bin/python
+
+from nfspy import NfSpy, NFSError, NF3DIR
+from optparse import OptionParser
+import os
+import stat
+import errno
+import sys
+import shlex
+import re
+import posixpath as path
+from datetime import datetime
+import inspect
+import logging
+
+logging.basicConfig(level=logging.DEBUG)
+
+reUnicode = re.compile(r'\{\{(?P<codepoint>\d+)\}\}')
+def uncode(string):
+    ret = ''
+    pos = 0
+    for m in reUnicode.finditer(string):
+        ret += string[pos:m.start()]
+        ret += unichr(int(m.group('codepoint')))
+        pos = m.end()
+    ret += string[pos:]
+    return ret
+
+def report(e):
+    sys.stderr.write("{0}\n".format(str(e)))
+
+class Exit(Exception):
+    pass
+
+class Commands(object):
+    def __init__(self, shell):
+        self.shell = shell
+    def __call__(self, *args):
+        if hasattr(self, args[0]):
+            func = getattr(self, args[0])
+            try:
+                func(*args[1:])
+            except TypeError as e:
+                logging.exception(e)
+                err = func.__doc__
+                if err:
+                    sys.stderr.write("Usage: {0}\n".format(err.split("\n",1)[0]))
+                else:
+                    sys.stderr.write("{0}: Incorrect usage\n".format(func.__name__))
+            except (OSError,IOError,NFSError) as e:
+                report(e)
+        else:
+            print "Unknown command: {0}".format(args[0])
+
+    def help(self, cmd=None):
+        """help [<cmd>]
+
+        Print a list of known commands. With <cmd>, print the help for <cmd>."""
+        if cmd:
+            if hasattr(self, cmd) and not cmd.startswith("_"):
+                func = getattr(self, cmd)
+                print func.__doc__ or "No help for {0}".format(cmd)
+            else:
+                print "Unknown command: {0}".format(cmd)
+        else:
+            print "Known commands:"
+            for c, _ in inspect.getmembers(self, inspect.ismethod):
+                if not c.startswith("_"):
+                    print "    {0}".format(c)
+
+    def cd(self, directory):
+        """cd <dir>
+
+        Change remote working directory to <dir>."""
+        self.shell.rcwd = self.shell.canonicalize(directory)
+        self.shell.spy.getattr(self.shell.rcwd)
+
+    def lcd(self, directory):
+        """lcd <dir>
+
+        Change local working directory to <dir>."""
+        os.chdir(directory)
+
+    def pwd(self):
+        """pwd
+
+        Print the current remote working directory."""
+        print self.shell.rcwd
+
+    def lpwd(self):
+        """lpwd
+
+        Print the current local working directory."""
+        print os.getcwd()
+
+    def ls(self, *args):
+        """ls [-r] [<filename> ...]
+
+        Print info about <filename>. <filename> defaults to '.'.
+        Columns are Mode, UID, GID, Size, Mtime, and Name.
+        '-r' enables recursive listing."""
+        tolist = list(args)
+        recursive = False
+        if "-r" in tolist:
+            recursive = True
+            tolist.remove("-r")
+        if not tolist:
+            tolist.append(".")
+        while tolist:
+            filename = tolist.pop()
+            f = self.shell.canonicalize(filename)
+            lines = None
+            dirname = None
+            try:
+                if self.shell.isdir(f):
+                    dirname = f
+                    print "{0}:".format(dirname)
+                    lines = self.shell.spy.readdir(f,0)
+                else:
+                    dirname = path.dirname(f)
+                    lines = [(None,path.basename(f))]
+                for entry in lines:
+                    name = entry[1]
+                    fullname = path.join(dirname, name)
+                    attr = self.shell.spy.getattr(fullname)
+                    if stat.S_ISDIR(attr.st_mode):
+                        if recursive and name != "." and name != "..":
+                            tolist.append(fullname)
+                    elif stat.S_ISLNK(attr.st_mode):
+                        dest = "<error>"
+                        try:
+                            dest = self.shell.spy.readlink(fullname)
+                        except IOError as e:
+                            report(e)
+                        name = "{0} -> {1}".format(name, dest)
+                    print "{mode:06o} {uid: >6} {gid: >6} {size: >11} {date!s} {name}".format(
+                            mode=attr.st_mode,
+                            uid=attr.st_uid,
+                            gid=attr.st_gid,
+                            size=attr.st_size,
+                            date=datetime.fromtimestamp(attr.st_mtime),
+                            name=name
+                            )
+            except IOError as e:
+                report(e)
+                continue
+
+    def get(self, filename, localname=None):
+        """get <filename> [<localname>]
+
+        Retrieve <filename> and save to <localname>. If no <localname> is given,
+        defaults to the basename of <filename> in the current local working directory."""
+        f = self.shell.canonicalize(filename)
+        size = self.shell.spy.getattr(f).st_size
+        if localname and os.path.isdir(localname):
+            localname = os.path.normpath(os.path.join(localname, path.basename(f)))
+        localname = localname or path.basename(f)
+        out = open(localname, "w")
+        bsize = self.shell.spy.rtsize
+        for offset in range(0, size, bsize):
+            out.write( self.shell.spy.read(f, bsize, offset) )
+        out.close()
+
+    def put(self, filename, remotename=None):
+        """put <filename> [<remotename>]
+
+        Upload <filename> to <remotename>. If no <remotename> is given,
+        defaults to the basename of <filename> in the current remote working directory."""
+        size = os.path.getsize(filename)
+        filein = open(filename, "r")
+        remotename = remotename or os.path.basename(filename)
+        f = self.shell.canonicalize(remotename)
+        bsize = self.shell.spy.wtsize
+        try:
+            self.shell.spy.mknod(f, 0100666 & ~self.shell.umask, 0)
+        except IOError as e:
+            if e.errno == errno.EEXIST:
+                if self.shell.isdir(f):
+                    f = path.normpath(path.join(f, os.path.basename(filename)))
+                    try:
+                        self.shell.spy.mknod(f, 0100666 & ~self.shell.umask, 0)
+                    except IOError as e:
+                        if e.errno == errno.EEXIST:
+                            self.shell.spy.truncate(f, 0)
+                        else:
+                            raise e
+                else:
+                    self.shell.spy.truncate(f, 0)
+            else:
+                raise e
+        for offset in range(0, size, bsize):
+            self.shell.spy.write( f, filein.read(min(bsize, size-offset)), offset )
+        filein.close()
+
+    def chmod(self, mode, filename):
+        """chmod <mode> <filename>
+
+        Change <filename>'s mode. <mode> must be 3 or 4 octal digits."""
+        mode = int(mode, 8)
+        if mode > 07777:
+            print "Invalid mode."
+            return
+        f = self.shell.canonicalize(filename)
+        self.shell.spy.chmod(f, mode)
+
+    def chown(self, ugid, filename):
+        """chown <uid:gid> <filename>
+
+        Change <filename>'s owner to <uid:gid>. uid and gid must be numeric.
+        Either uid or gid may be blank (no change)."""
+        ugid = ugid.split(':',1)
+        uid = gid = None
+        if len(ugid) == 2:
+            uid, gid = ugid
+        else:
+            uid = ugid[0]
+        uid = int(uid) if uid else None
+        gid = int(gid) if gid else None
+        f = self.shell.canonicalize(filename)
+        self.shell.spy.chown(f, uid, gid)
+
+    def mkdir(self, dirname):
+        """mkdir <dirname>
+
+        Create a directory at <dirname>."""
+        n = self.shell.canonicalize(dirname)
+        self.shell.spy.mkdir(n, 0777 & ~self.shell.umask )
+
+    def rmdir(self, dirname):
+        """rmdir <dirname>
+
+        Remove the directory at <dirname>."""
+        n = self.shell.canonicalize(dirname)
+        self.shell.spy.rmdir(n)
+
+    def rm(self, filename):
+        """rm <filename>
+
+        Remove <filename>."""
+        f = self.shell.canonicalize(filename)
+        self.shell.spy.unlink(f)
+
+    def mv(self, old, new):
+        """mv <old> <new>
+
+        Rename <old> to <new>. If <new> is a directory, move <old> into <new>."""
+        old = self.shell.canonicalize(old)
+        new = self.shell.canonicalize(new)
+        try:
+            attr = self.shell.spy.getattr(new)
+            if stat.S_ISDIR(attr.st_mode):
+                new = path.normpath(path.join(new, path.basename(old)))
+        except IOError as e:
+            if e.errno != errno.ENOENT:
+                raise e
+        self.shell.spy.rename(old, new)
+
+    def umask(self, mask=None):
+        """umask [<mask>]
+
+        Show current umask or set umask to <mask> (octal)."""
+        if mask:
+            self.shell.umask = int(mask,8)
+        else:
+            print "{0:03o}".format(self.shell.umask)
+
+    def df(self):
+        """df
+
+        Show disk usage."""
+        fsstat = self.shell.spy.statfs()
+        hb = ("{0}B-blocks".format(fsstat.f_frsize), "Used", "Available", "Use")
+        vb = (fsstat.f_blocks, fsstat.f_blocks-fsstat.f_bfree, fsstat.f_bavail, int(round(100 - 100.0*fsstat.f_bfree/fsstat.f_blocks)))
+        sep = ("---", "---", "---", "---")
+        hf = ("Files", "Used", "Available", "Use")
+        vf = (fsstat.f_files, fsstat.f_files-fsstat.f_ffree, fsstat.f_favail, int(round(100 - 100.0*fsstat.f_ffree/fsstat.f_files)))
+        w = tuple( max( len(str(row[i])) for row in (hb,vb,hf,vf) ) for i in range(4) )
+        for row in (hb,vb,sep,hf,vf):
+            print " ".join("{0:>{1}}".format(*x) for x in zip(row,w)) +"%"
+
+    def exit(self):
+        """exit
+
+        Close nfspysh, shutting down connection to the server."""
+        raise Exit
+
+class Shell(object):
+    def __init__(self, spy):
+        self.spy = spy
+        self.spy.fsinit()
+        self.runner = Commands(self)
+        self.rcwd = "/"
+        self.umask = 022
+
+    def canonicalize(self,pathname):
+        ret = None
+        if path.isabs(pathname):
+            ret = path.normpath( pathname )
+        else:
+            ret = path.normpath( path.join( self.rcwd, pathname ) )
+        return ret
+
+    def isdir(self, pathname):
+        pathname = self.canonicalize(pathname)
+        _, fattr = self.spy.gethandle(pathname)
+        return fattr[0] == NF3DIR
+
+    def prompt(self):
+        return "nfspy@{server}:{export}:{path}> ".format(
+            server = self.spy.host,
+            export = self.spy.path,
+            path = self.rcwd
+            )
+
+    def docmd(self, line):
+        line = line.strip()
+        if line == "":
+            return
+        try:
+            line = line.encode('ascii')
+        except UnicodeEncodeError:
+            try:
+                line2 = ''
+                for c in line:
+                    if ord(c) < 128:
+                        line2 += c
+                    else:
+                        line2 += '{{%d}}'%(ord(c))
+                line = line2.encode('ascii')
+            except TypeError:
+                print "Can't handle that code point"
+                return
+        arr = map(uncode, shlex.split(line, posix=False))
+        self.runner(*arr)
+
+    def run(self):
+        sys.stdout.write(self.prompt())
+        line = sys.stdin.readline().decode(sys.stdin.encoding)
+        while line:
+            try:
+                self.docmd(line)
+            except Exit:
+                break
+            except Exception as e:
+                logging.exception(e)
+            sys.stdout.write(self.prompt())
+            line = sys.stdin.readline().decode(sys.stdin.encoding)
+        print "Quitting."
+
+    def close(self):
+        self.spy.fsdestroy()
+
+if __name__ == '__main__':
+    def help_options(option, opt_str, value, parser):
+        print "Options that may be specified to -o"
+        for opt in NfSpy.options:
+            fmt = "  {example: <26}{help}"
+            example = opt['mountopt']
+            if 'metavar' in opt:
+                example = "{mountopt}={metavar}".format(**opt)
+            if 'default' in opt:
+                fmt += " (default {default})"
+            print fmt.format(example=example,**opt)
+        sys.exit(0)
+
+    parser = OptionParser()
+    parser.add_option('-l', action='callback', callback=help_options, help="List mount options available")
+    parser.add_option('-o', action='store', nargs=1, type='string',
+            metavar="OPTIONS",
+            help="Mount options as in nfspy")
+    parser.add_option('-c', action='store', nargs=1, type='string', dest="batchcommand",
+            metavar="COMMAND",
+            help="Semicolon-separated commands to run (batch mode)")
+
+    (opts, args) = parser.parse_args()
+
+    spy = None
+    if not opts.o:
+        parser.error("Required option -o not present")
+    else:
+        oargs = {}
+        for pair in (o.split('=') for o in opts.o.split(',')):
+            try:
+                oargs[pair[0]] = pair[1]
+            except IndexError:
+                oargs[pair[0]] = True
+        spy = NfSpy(**oargs)
+
+    sh = Shell(spy)
+    #Print some info from statfs?
+
+    if opts.batchcommand:
+        for cmd in opts.batchcommand.split(';'):
+            sh.docmd(cmd)
+    else:
+        sh.run()
+
+    sh.close()

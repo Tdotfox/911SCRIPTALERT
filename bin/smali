@@ -1,0 +1,3 @@
+#!/bin/bash
+
+cd /usr/share/smali/ && java -jar smali-2.2.2.jar "$@"
